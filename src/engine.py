@@ -20,7 +20,8 @@ import sys
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from downstream_inference.settings import (
     MODELS_DIR, IMAGES_DIR, IMAGES_INDEX_PATH,
-    IMAGE_COLLECTION_NAME, DEFAULT_K, OPENAI_API_KEY, OPENAI_BASE_URL
+    IMAGE_COLLECTION_NAME, DEFAULT_K, OPENAI_API_KEY, OPENAI_BASE_URL,
+    OPENAI_MODEL_ID, CLIP_MODEL_ID
 )
 
 
@@ -57,6 +58,9 @@ class ImageRAG:
         """Initialize Image RAG resources (ImageLoader + CLIP + ChromaDB)"""
         print("\n>>> [INIT] Image RAG Engine...")
 
+        if not CLIP_MODEL_ID:
+            raise ValueError("Missing CLIP_MODEL_ID in environment configuration.")
+
         self.image_loader = ImageLoader()
         local_ckpt_path = os.path.join(MODELS_DIR, "open_clip_pytorch_model.bin")
 
@@ -64,7 +68,7 @@ class ImageRAG:
             if os.path.exists(local_ckpt_path):
                 print(f"   + Loading CLIP model from local checkpoint: {local_ckpt_path}")
                 self.clip_model = OpenCLIPEmbeddingFunction(
-                    model_name="ViT-B-32",
+                    model_name=CLIP_MODEL_ID,
                     checkpoint=local_ckpt_path
                 )
                 print("✅ CLIP model loaded successfully from local checkpoint.")
@@ -74,7 +78,7 @@ class ImageRAG:
         except Exception as e:
             print(f"⚠️ Failed to load local CLIP model: {e}")
             print("   -> Falling back to HuggingFace model download")
-            self.clip_model = OpenCLIPEmbeddingFunction(model_name="ViT-B-32")
+            self.clip_model = OpenCLIPEmbeddingFunction(model_name=CLIP_MODEL_ID)
             print("✅ CLIP model loaded from HuggingFace.")
 
         try:
@@ -163,8 +167,10 @@ class ImageRAG:
                 else:
                     raise last_error
 
-    def extract_query_intent(self, user_query: str, model_name="gpt-4o"):
+    def extract_query_intent(self, user_query: str, model_name=OPENAI_MODEL_ID):
         """Bóc tách ý định người dùng thành JSON chứa từ khóa tiếng Anh và ngày tháng"""
+        if not model_name:
+            raise ValueError("Missing OPENAI_MODEL_ID in environment configuration.")
         print(f"\n🕵️ Đang phân tích yêu cầu: '{user_query}'")
 
         prompt = f"""
@@ -366,9 +372,11 @@ class ImageRAG:
             print(f"⚠️ Lỗi khi nén ảnh {image_path}: {e}")
             return ""
 
-    def rag_generate_explanation(self, query_text, retrieved_data, model_name="gpt-4o"):
+    def rag_generate_explanation(self, query_text, retrieved_data, model_name=OPENAI_MODEL_ID):
         if not retrieved_data:
             return "Không tìm thấy hình ảnh nào phù hợp trong cơ sở dữ liệu để phân tích."
+        if not model_name:
+            raise ValueError("Missing OPENAI_MODEL_ID in environment configuration.")
 
         retrieved_uris = [item["uri"] for item in retrieved_data]
 

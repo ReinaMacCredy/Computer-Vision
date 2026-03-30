@@ -12,7 +12,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 
 from src.engine import ImageRAG
-from downstream_inference.settings import IMAGES_DIR
+from downstream_inference.settings import IMAGES_DIR, OPENAI_MODEL_ID
 
 # ==========================================
 # 1. CẤU HÌNH GIAO DIỆN & KHỞI TẠO MODEL
@@ -201,7 +201,7 @@ with tab1:
             if use_ai_intent:
                 with st.spinner("Đang phân tích yêu cầu..."):
                     try:
-                        intent = engine.extract_query_intent(query_text, model_name="gpt-5.4")
+                        intent = engine.extract_query_intent(query_text, model_name=OPENAI_MODEL_ID)
                     except Exception as e:
                         intent = {
                             "english_query": query_text,
@@ -272,7 +272,7 @@ with tab1:
                         explanation = engine.rag_generate_explanation(
                             query_text=query_text,
                             retrieved_data=found_data,
-                            model_name="gpt-5.4"
+                            model_name=OPENAI_MODEL_ID
                         )
                         render_ai_explanation(explanation)
                     except Exception as e:

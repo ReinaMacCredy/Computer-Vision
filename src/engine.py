@@ -19,8 +19,8 @@ import math
 import sys
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from downstream_inference.settings import (
-    KEY_PATH, MODELS_DIR, IMAGES_DIR, IMAGES_INDEX_PATH,
-    IMAGE_COLLECTION_NAME, DEFAULT_K
+    MODELS_DIR, IMAGES_DIR, IMAGES_INDEX_PATH,
+    IMAGE_COLLECTION_NAME, DEFAULT_K, OPENAI_API_KEY, OPENAI_BASE_URL
 )
 
 
@@ -48,22 +48,9 @@ class ImageRAG:
         self._init_resources()
 
     def _load_api_config(self):
-        """Load API Key and Base URL from json file"""
-        api_key = ""
-        base_url = None
-
-        if os.path.exists(KEY_PATH):
-            try:
-                with open(KEY_PATH, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-                    api_key = data.get("api_key", "")
-                    base_url = data.get("base_url")
-            except Exception as e:
-                print(f"⚠️ Error reading key.json: {e}")
-
-        if not api_key:
-            api_key = os.getenv("GOOGLE_API_KEY", "")
-
+        """Load API key and base URL from environment variables."""
+        api_key = OPENAI_API_KEY or os.getenv("GOOGLE_API_KEY", "")
+        base_url = OPENAI_BASE_URL
         return api_key, base_url
 
     def _init_resources(self):
@@ -517,7 +504,7 @@ Thông tin hệ thống cung cấp:
                 return (
                     f"⚠️ Rất tiếc, máy chủ API proxy đang không hoạt động sau nhiều lần thử lại.\n\n"
                     f"**Chi tiết lỗi:** {short_error2}\n\n"
-                    f"💡 **Gợi ý:** Hãy kiểm tra lại `base_url` trong file `downstream_inference/keys.json` hoặc thử lại sau vài phút."
+                    f"💡 **Gợi ý:** Hãy kiểm tra lại biến môi trường `OPENAI_BASE_URL` hoặc thử lại sau vài phút."
                 )
 
     # ==========================================

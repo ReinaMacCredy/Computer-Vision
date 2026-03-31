@@ -12,8 +12,10 @@ import chromadb
 from chromadb.utils.embedding_functions import OpenCLIPEmbeddingFunction
 from chromadb.utils.data_loaders import ImageLoader
 from openai import OpenAI
+from openai import APIStatusError
 import io
 import math
+import re
 
 # Import cấu hình từ file settings
 import sys
@@ -21,7 +23,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from downstream_inference.settings import (
     MODELS_DIR, IMAGES_DIR, IMAGES_INDEX_PATH,
     IMAGE_COLLECTION_NAME, DEFAULT_K, OPENAI_API_KEY, OPENAI_BASE_URL,
-    OPENAI_MODEL_ID, CLIP_MODEL_ID
+    OPENAI_TEXT_MODEL_ID, OPENAI_VISION_MODEL_ID, CLIP_MODEL_ID
 )
 
 
@@ -167,17 +169,123 @@ class ImageRAG:
                 else:
                     raise last_error
 
-    def extract_query_intent(self, user_query: str, model_name=OPENAI_MODEL_ID):
+    def _extract_text_content(self, response) -> str:
+        raw_text = response.choices[0].message.content
+        if isinstance(raw_text, list):
+            raw_text = "".join(
+                item.get("text", "")
+                for item in raw_text
+                if isinstance(item, dict)
+            )
+        return (raw_text or "").strip()
+
+    def _call_fireworks_vision_with_retry(
+        self,
+        model_name,
+        prompt,
+        image_urls,
+        max_tokens=800,
+        temperature=0.1,
+        max_retries=3
+    ):
+        """Gọi Fireworks vision theo định dạng completions + extra_body.images."""
+        last_error = None
+        for attempt in range(1, max_retries + 1):
+            try:
+                print(f"   -> Vision attempt {attempt}/{max_retries}...")
+                response = self.client.completions.create(
+                    model=model_name,
+                    prompt=prompt,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    extra_body={"images": image_urls}
+                )
+                return response
+            except Exception as e:
+                last_error = e
+                error_msg = str(e)
+                is_retryable = any(code in error_msg for code in ["502", "503", "504", "timeout", "Service unavailable", "Bad Gateway"])
+                if is_retryable and attempt < max_retries:
+                    wait_time = 2 ** attempt
+                    print(f"   ⚠️ Vision server error (attempt {attempt}): {error_msg[:100]}... Wait {wait_time}s.")
+                    time.sleep(wait_time)
+                else:
+                    raise last_error
+
+    def ping_provider(self) -> Dict[str, Any]:
+        """Ping nhà cung cấp OpenAI-compatible và trả về trạng thái chi tiết."""
+        if not self.openai_base_url:
+            return {
+                "ok": False,
+                "status_code": None,
+                "message": "Thiếu OPENAI_BASE_URL."
+            }
+
+        if not self.openai_api_key:
+            return {
+                "ok": False,
+                "status_code": None,
+                "message": "Thiếu OPENAI_API_KEY."
+            }
+
+        if not OPENAI_TEXT_MODEL_ID and not OPENAI_VISION_MODEL_ID:
+            return {
+                "ok": False,
+                "status_code": None,
+                "message": "Thiếu OPENAI_TEXT_MODEL_ID hoặc OPENAI_VISION_MODEL_ID."
+            }
+
+        checks = []
+        for label, model_id in [("text", OPENAI_TEXT_MODEL_ID), ("vision", OPENAI_VISION_MODEL_ID)]:
+            if not model_id:
+                continue
+            try:
+                self.client.chat.completions.create(
+                    model=model_id,
+                    messages=[{"role": "user", "content": "ping"}],
+                    max_tokens=1,
+                    temperature=0
+                )
+                checks.append(f"{label}: ok (`{model_id}`)")
+            except APIStatusError as e:
+                message = str(e)
+                if e.status_code == 401:
+                    message = f"{label}: 401 Unauthorized - API key không hợp lệ hoặc thiếu quyền."
+                elif e.status_code == 404:
+                    message = f"{label}: 404 Not Found - endpoint hoặc model ID `{model_id}` không đúng."
+                elif e.status_code == 400:
+                    message = f"{label}: 400 Bad Request - model ID `{model_id}` hoặc request format không phù hợp."
+                return {
+                    "ok": False,
+                    "status_code": e.status_code,
+                    "message": message
+                }
+            except Exception as e:
+                status_code = getattr(getattr(e, "response", None), "status_code", None)
+                return {
+                    "ok": False,
+                    "status_code": status_code,
+                    "message": f"{label}: {str(e)}"
+                }
+
+        return {
+            "ok": True,
+            "status_code": 200,
+            "message": " | ".join(checks)
+        }
+
+    def extract_query_intent(self, user_query: str, model_name=OPENAI_TEXT_MODEL_ID):
         """Bóc tách ý định người dùng thành JSON chứa từ khóa tiếng Anh và ngày tháng"""
         if not model_name:
-            raise ValueError("Missing OPENAI_MODEL_ID in environment configuration.")
+            raise ValueError("Missing OPENAI_TEXT_MODEL_ID in environment configuration.")
         print(f"\n🕵️ Đang phân tích yêu cầu: '{user_query}'")
 
         prompt = f"""
         Bạn là hệ thống trích xuất dữ liệu. Hôm nay là năm 2026.
         Hãy phân tích yêu cầu: "{user_query}"
 
-        Trả về DUY NHẤT một JSON hợp lệ với các trường:
+        Chỉ được trả về DUY NHẤT một JSON object hợp lệ, không markdown, không giải thích thêm, không code fence.
+        JSON phải có các trường:
         - "english_query": Dịch chủ đề chính cần tìm trong ảnh sang tiếng Anh (ngắn gọn, VD: "yellow dog").
         - "start_date": Ngày bắt đầu (YYYY-MM-DD). VD: "năm nay" là "2026-01-01". Nếu không có thì để null.
         - "end_date": Ngày kết thúc (YYYY-MM-DD). VD: "năm nay" là "2026-12-31". Nếu không có thì để null.
@@ -191,12 +299,19 @@ class ImageRAG:
                 max_tokens=300,
                 temperature=0
             )
-            raw_text = response.choices[0].message.content.strip()
+            raw_text = self._extract_text_content(response)
+
+            if not raw_text:
+                raise ValueError("Provider responded with empty content.")
 
             if raw_text.startswith("```json"):
                 raw_text = raw_text[7:-3].strip()
             elif raw_text.startswith("```"):
                 raw_text = raw_text[3:-3].strip()
+
+            json_match = re.search(r"\{.*\}", raw_text, re.DOTALL)
+            if json_match:
+                raw_text = json_match.group(0).strip()
 
             intent_data = json.loads(raw_text)
             print(f"✅ Bóc tách thành công: {json.dumps(intent_data, indent=2, ensure_ascii=False)}")
@@ -210,7 +325,8 @@ class ImageRAG:
                 "start_date": None,
                 "end_date": None,
                 "max_results": 4,
-                "_llm_error": f"Không thể kết nối API LLM: {short_error}"
+                "_llm_error": f"Provider đã phản hồi nhưng nội dung không phải JSON hợp lệ: {short_error}",
+                "_llm_raw_output": raw_text if 'raw_text' in locals() else ""
             }
 
     # ==========================================
@@ -372,7 +488,7 @@ class ImageRAG:
             print(f"⚠️ Lỗi khi nén ảnh {image_path}: {e}")
             return ""
 
-    def rag_generate_explanation(self, query_text, retrieved_data, model_name=OPENAI_MODEL_ID):
+    def rag_generate_explanation(self, query_text, retrieved_data, model_name=OPENAI_VISION_MODEL_ID):
         if not retrieved_data:
             return "Không tìm thấy hình ảnh nào phù hợp trong cơ sở dữ liệu để phân tích."
         if not model_name:
@@ -432,21 +548,16 @@ Thông tin hệ thống cung cấp:
 """
 
         vision_messages = [
-            {"role": "system", "content": system_prompt},
-            {
-                "role": "user",
-                "content": [{
-                    "type": "text",
-                    "text": (
-                        f"Yêu cầu người dùng: '{query_text}'. "
-                        f"Hãy giải thích kết quả thật ngắn gọn, súc tích và chính xác. "
-                        f"Ưu tiên nêu kết luận mức độ phù hợp trước, sau đó chỉ nêu các ý quan trọng nhất. "
-                        f"Không lan man, không suy đoán quá mức."
-                    )
-                }]
-            }
+            system_prompt,
+            (
+                f"Yêu cầu người dùng: '{query_text}'. "
+                f"Hãy giải thích kết quả thật ngắn gọn, súc tích và chính xác. "
+                f"Ưu tiên nêu kết luận mức độ phù hợp trước, sau đó chỉ nêu các ý quan trọng nhất. "
+                f"Không lan man, không suy đoán quá mức."
+            )
         ]
 
+        image_payloads = []
         for uri in retrieved_uris:
             base64_img = self._encode_image_to_base64(uri)
             if not base64_img:
@@ -456,23 +567,19 @@ Thông tin hệ thống cung cấp:
             if not mime_type:
                 mime_type = "image/jpeg"
 
-            vision_messages[1]["content"].append({
-                "type": "image_url",
-                "image_url": {
-                    "url": f"data:{mime_type};base64,{base64_img}",
-                    "detail": "low"
-                }
-            })
+            image_payloads.append(f"data:{mime_type};base64,{base64_img}")
 
         try:
             print("   -> Đang thử gọi API chế độ Vision...")
-            response = self._call_llm_with_retry(
+            vision_prompt = "SYSTEM: " + vision_messages[0] + "\n\nUSER:<image>\n" + vision_messages[1] + "\n\nASSISTANT:"
+            response = self._call_fireworks_vision_with_retry(
                 model_name=model_name,
-                messages=vision_messages,
+                prompt=vision_prompt,
+                image_urls=image_payloads,
                 max_tokens=800,
                 temperature=0.1
             )
-            return response.choices[0].message.content
+            return (response.choices[0].text or "").strip()
 
         except Exception as e:
             error_msg = str(e)
@@ -505,7 +612,7 @@ Thông tin hệ thống cung cấp:
                 return (
                     "*(Lưu ý: Server Custom API hiện tại không thể xử lý ảnh trực quan, "
                     "hệ thống tự động chuyển sang giải thích bằng siêu dữ liệu)*\n\n"
-                    + response_text_only.choices[0].message.content
+                    + self._extract_text_content(response_text_only)
                 )
             except Exception as e2:
                 short_error2 = str(e2)[:200] if len(str(e2)) > 200 else str(e2)

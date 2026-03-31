@@ -12,7 +12,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 
 from src.engine import ImageRAG
-from downstream_inference.settings import IMAGES_DIR, OPENAI_MODEL_ID
+from downstream_inference.settings import IMAGES_DIR, OPENAI_TEXT_MODEL_ID, OPENAI_VISION_MODEL_ID
 
 # ==========================================
 # 1. CẤU HÌNH GIAO DIỆN & KHỞI TẠO MODEL
@@ -69,6 +69,18 @@ def load_engine():
 
 with st.spinner("Đang tải mô hình CLIP và kết nối Database..."):
     engine = load_engine()
+
+top_left, _ = st.columns([1, 5])
+with top_left:
+    if st.button("Ping provider"):
+        with st.spinner("Đang kiểm tra provider..."):
+            ping_result = engine.ping_provider()
+        status_code = ping_result.get("status_code")
+        status_label = f"HTTP {status_code}" if status_code is not None else "No HTTP status"
+        if ping_result.get("ok"):
+            st.success(f"{status_label}: {ping_result.get('message')}")
+        else:
+            st.error(f"{status_label}: {ping_result.get('message')}")
 
 # ==========================================
 # 2. HÀM HỖ TRỢ
@@ -201,7 +213,7 @@ with tab1:
             if use_ai_intent:
                 with st.spinner("Đang phân tích yêu cầu..."):
                     try:
-                        intent = engine.extract_query_intent(query_text, model_name=OPENAI_MODEL_ID)
+                        intent = engine.extract_query_intent(query_text, model_name=OPENAI_TEXT_MODEL_ID)
                     except Exception as e:
                         intent = {
                             "english_query": query_text,
@@ -213,10 +225,14 @@ with tab1:
 
                 if "_llm_error" in intent:
                     st.warning(
-                        "⚠️ Không kết nối được API LLM để phân tích. "
+                        "⚠️ Provider có phản hồi nhưng không trả về JSON hợp lệ để phân tích. "
                         "Hệ thống sẽ tìm trực tiếp bằng từ khóa gốc.\n\n"
                         f"*Chi tiết: {intent['_llm_error']}*"
                     )
+                    raw_output = intent.get("_llm_raw_output")
+                    if raw_output:
+                        with st.expander("Xem phản hồi thô từ model"):
+                            st.code(raw_output)
 
                 if not intent.get("max_results"):
                     intent["max_results"] = int(top_k)
@@ -272,7 +288,7 @@ with tab1:
                         explanation = engine.rag_generate_explanation(
                             query_text=query_text,
                             retrieved_data=found_data,
-                            model_name=OPENAI_MODEL_ID
+                            model_name=OPENAI_VISION_MODEL_ID
                         )
                         render_ai_explanation(explanation)
                     except Exception as e:

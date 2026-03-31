@@ -14,5 +14,6 @@ DEFAULT_K = 5
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
-OPENAI_MODEL_ID = os.getenv("OPENAI_MODEL_ID", "")
+OPENAI_TEXT_MODEL_ID = os.getenv("OPENAI_TEXT_MODEL_ID", "")
+OPENAI_VISION_MODEL_ID = os.getenv("OPENAI_VISION_MODEL_ID", "")
 CLIP_MODEL_ID = os.getenv("CLIP_MODEL_ID", "")

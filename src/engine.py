@@ -179,6 +179,62 @@ class ImageRAG:
             )
         return (raw_text or "").strip()
 
+    def _split_thinking_and_answer(self, response) -> dict:
+        """
+        Split reasoning model output into thinking + answer parts.
+        Returns dict with 'thinking', 'answer', and 'raw' keys.
+        Both parts are preserved -- nothing is discarded.
+        """
+        raw_text = self._extract_text_content(response)
+        if not raw_text:
+            return {"thinking": "", "answer": "", "raw": ""}
+
+        # Try to find a split point between thinking and answer
+        answer_markers = [
+            "\n\nDraft:", "\n\nResponse:", "\n\nAnswer:",
+            "\n\nKết quả:", "\n\nTrả lời:",
+            "\nDraft:", "\nResponse:", "\nAnswer:",
+            "\nDraft:\n", "\nResponse:\n", "\nAnswer:\n",
+        ]
+
+        for marker in answer_markers:
+            if marker in raw_text:
+                parts = raw_text.split(marker, 1)
+                thinking = parts[0].strip()
+                answer = parts[1].strip()
+                # Clean marker prefix from answer if duplicated
+                answer = re.sub(r'^(Draft|Response|Answer|Kết quả|Trả lời)\s*:\s*\n?', '', answer).strip()
+                return {"thinking": thinking, "answer": answer, "raw": raw_text}
+
+        # No marker found -- check if it looks like reasoning text
+        thinking_signals = ["let me", "wait,", "actually,", "hmm", "i need to",
+                           "i should", "looking at", "key constraints", "the user wants"]
+        has_thinking = any(s in raw_text.lower() for s in thinking_signals)
+
+        if has_thinking:
+            # Split at the last double newline -- thinking is before, answer is after
+            blocks = raw_text.strip().split("\n\n")
+            if len(blocks) >= 3:
+                # Heuristic: last 1-2 blocks are the answer, rest is thinking
+                # Find where thinking ends by scanning from end
+                answer_start = len(blocks)
+                for i in range(len(blocks) - 1, -1, -1):
+                    block_lower = blocks[i].strip().lower()
+                    if any(s in block_lower for s in thinking_signals):
+                        answer_start = i + 1
+                        break
+
+                if answer_start < len(blocks):
+                    thinking = "\n\n".join(blocks[:answer_start])
+                    answer = "\n\n".join(blocks[answer_start:])
+                    return {"thinking": thinking, "answer": answer, "raw": raw_text}
+
+            # Can't split well -- return all as answer, no separate thinking
+            return {"thinking": "", "answer": raw_text, "raw": raw_text}
+
+        # No thinking detected -- it's a clean response
+        return {"thinking": "", "answer": raw_text, "raw": raw_text}
+
     def _call_fireworks_vision_with_retry(
         self,
         model_name,
@@ -280,23 +336,30 @@ class ImageRAG:
             raise ValueError("Missing OPENAI_TEXT_MODEL_ID in environment configuration.")
         print(f"\n🕵️ Đang phân tích yêu cầu: '{user_query}'")
 
-        prompt = f"""
-        Bạn là hệ thống trích xuất dữ liệu. Hôm nay là năm 2026.
-        Hãy phân tích yêu cầu: "{user_query}"
+        today_str = datetime.now().strftime("%Y-%m-%d")
+        current_year = datetime.now().strftime("%Y")
 
-        Chỉ được trả về DUY NHẤT một JSON object hợp lệ, không markdown, không giải thích thêm, không code fence.
-        JSON phải có các trường:
-        - "english_query": Dịch chủ đề chính cần tìm trong ảnh sang tiếng Anh (ngắn gọn, VD: "yellow dog").
-        - "start_date": Ngày bắt đầu (YYYY-MM-DD). VD: "năm nay" là "2026-01-01". Nếu không có thì để null.
-        - "end_date": Ngày kết thúc (YYYY-MM-DD). VD: "năm nay" là "2026-12-31". Nếu không có thì để null.
-        - "max_results": Số lượng ảnh muốn tìm (số nguyên). Mặc định 4.
-        """
+        prompt = f"""You are a strict JSON extraction system. Today is {today_str} (year {current_year}).
+Analyze this request: "{user_query}"
+
+You MUST respond with ONLY a single valid JSON object. No thinking, no explanation, no markdown, no code fence.
+
+{{"english_query": "<translate the main image subject to English, e.g. yellow dog>", "start_date": "<YYYY-MM-DD or null>", "end_date": "<YYYY-MM-DD or null>", "max_results": <integer, default 4>}}
+
+Examples:
+- "ảnh chó vàng năm nay" -> {{"english_query": "yellow dog", "start_date": "{current_year}-01-01", "end_date": "{current_year}-12-31", "max_results": 4}}
+- "find me cats" -> {{"english_query": "cat", "start_date": null, "end_date": null, "max_results": 4}}
+
+RESPOND WITH ONLY THE JSON OBJECT:"""
 
         try:
             response = self._call_llm_with_retry(
                 model_name=model_name,
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=300,
+                messages=[
+                    {"role": "system", "content": "You are a JSON-only extraction API. Never explain, never think out loud. Output exactly one JSON object."},
+                    {"role": "user", "content": prompt}
+                ],
+                max_tokens=800,
                 temperature=0
             )
             raw_text = self._extract_text_content(response)
@@ -304,17 +367,74 @@ class ImageRAG:
             if not raw_text:
                 raise ValueError("Provider responded with empty content.")
 
-            if raw_text.startswith("```json"):
-                raw_text = raw_text[7:-3].strip()
-            elif raw_text.startswith("```"):
-                raw_text = raw_text[3:-3].strip()
+            # Strip markdown code fences if present
+            cleaned = raw_text.strip()
+            if cleaned.startswith("```json"):
+                cleaned = cleaned[7:]
+            if cleaned.startswith("```"):
+                cleaned = cleaned[3:]
+            if cleaned.endswith("```"):
+                cleaned = cleaned[:-3]
+            cleaned = cleaned.strip()
 
-            json_match = re.search(r"\{.*\}", raw_text, re.DOTALL)
-            if json_match:
-                raw_text = json_match.group(0).strip()
+            # Strategy 1: Try parsing cleaned text directly
+            intent_data = None
+            try:
+                intent_data = json.loads(cleaned)
+            except json.JSONDecodeError:
+                pass
 
-            intent_data = json.loads(raw_text)
-            print(f"✅ Bóc tách thành công: {json.dumps(intent_data, indent=2, ensure_ascii=False)}")
+            # Strategy 2: Find all complete JSON objects, prefer one with "english_query"
+            if intent_data is None:
+                json_objects = list(re.finditer(r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}', raw_text))
+                for match in reversed(json_objects):
+                    try:
+                        candidate = json.loads(match.group(0))
+                        if "english_query" in candidate:
+                            intent_data = candidate
+                            break
+                    except json.JSONDecodeError:
+                        continue
+
+            # Strategy 3: Reasoning model output -- extract fields manually via regex
+            if intent_data is None:
+                eq_match = re.search(r'"english_query"\s*:\s*"([^"]*)"', raw_text)
+                sd_match = re.search(r'"start_date"\s*:\s*"([^"]*)"', raw_text)
+                ed_match = re.search(r'"end_date"\s*:\s*"([^"]*)"', raw_text)
+                mr_match = re.search(r'"max_results"\s*:\s*(\d+)', raw_text)
+
+                if eq_match:
+                    intent_data = {
+                        "english_query": eq_match.group(1),
+                        "start_date": sd_match.group(1) if sd_match else None,
+                        "end_date": ed_match.group(1) if ed_match else None,
+                        "max_results": int(mr_match.group(1)) if mr_match else 4,
+                        "_parsed_from": "regex_fallback"
+                    }
+
+            # Strategy 4: Extract key-value pairs from reasoning text (non-JSON format)
+            if intent_data is None:
+                eq_alt = re.search(r'english_query:\s*"?([^"\n,]+)"?', raw_text)
+                sd_alt = re.search(r'start_date:\s*"?(\d{4}-\d{2}-\d{2})"?', raw_text)
+                ed_alt = re.search(r'end_date:\s*"?(\d{4}-\d{2}-\d{2})"?', raw_text)
+                mr_alt = re.search(r'max_results:\s*(\d+)', raw_text)
+
+                if eq_alt:
+                    intent_data = {
+                        "english_query": eq_alt.group(1).strip(),
+                        "start_date": sd_alt.group(1) if sd_alt else None,
+                        "end_date": ed_alt.group(1) if ed_alt else None,
+                        "max_results": int(mr_alt.group(1)) if mr_alt else 4,
+                        "_parsed_from": "reasoning_text_fallback"
+                    }
+
+            if intent_data is None:
+                raise ValueError("Could not extract intent from model response.")
+
+            # Store raw thinking for UI display
+            intent_data["_llm_raw_output"] = raw_text
+            parsed_from = intent_data.pop("_parsed_from", "direct_json")
+            print(f"✅ Bóc tách thành công (via {parsed_from}): {json.dumps(intent_data, indent=2, ensure_ascii=False)}")
             return intent_data
         except Exception as e:
             error_msg = str(e)
@@ -338,12 +458,14 @@ class ImageRAG:
         date: Optional[List[str]] = None,
         start_date: Optional[str] = None,
         end_date: Optional[str] = None,
-        max_results=DEFAULT_K
+        max_results=DEFAULT_K,
+        min_similarity: Optional[float] = None
     ) -> List[dict]:
         """Hàm truy xuất thuần Python trả về list dict chứa thông tin ảnh"""
         print("\n>>> [Image RAG] Retrieving images for query:", user_query)
         print("    With specific date:", date)
-        print("    With period from", start_date, "to", end_date, "\n")
+        print("    With period from", start_date, "to", end_date)
+        print("    Min similarity threshold:", min_similarity, "\n")
 
         start = time.time()
         images_data = self.image_uris(
@@ -352,7 +474,8 @@ class ImageRAG:
             start_date=start_date,
             end_date=end_date,
             max_results=max_results,
-            max_distance=None
+            max_distance=None,
+            min_similarity=min_similarity
         )
         print("    Retrieved images in:", time.time() - start, "seconds")
 
@@ -377,7 +500,8 @@ class ImageRAG:
         start_date: str = None,
         end_date: str = None,
         max_distance=None,
-        max_results=DEFAULT_K
+        max_results=DEFAULT_K,
+        min_similarity: float = None
     ):
         if date is not None:
             results = self.collection.query(
@@ -418,6 +542,10 @@ class ImageRAG:
 
             similarity = self._distance_to_similarity(distance)
 
+            # Filter by minimum similarity threshold
+            if min_similarity is not None and similarity is not None and similarity < min_similarity:
+                continue
+
             filtered_results.append({
                 "rank": rank,
                 "uri": uri,
@@ -429,7 +557,7 @@ class ImageRAG:
 
         return filtered_results
 
-    def image_to_image_retrieval(self, query_image_path: str, max_results=DEFAULT_K, max_distance=None):
+    def image_to_image_retrieval(self, query_image_path: str, max_results=DEFAULT_K, max_distance=None, min_similarity: float = None):
         if not os.path.exists(query_image_path):
             raise FileNotFoundError(f"Không tìm thấy ảnh truy vấn: {query_image_path}")
 
@@ -454,6 +582,10 @@ class ImageRAG:
                 continue
 
             similarity = self._distance_to_similarity(distance)
+
+            # Filter by minimum similarity threshold
+            if min_similarity is not None and similarity is not None and similarity < min_similarity:
+                continue
 
             filtered_results.append({
                 "rank": rank,
@@ -528,36 +660,36 @@ class ImageRAG:
                 f"metric = {item.get('metric', 'unknown')}\n"
             )
 
-        system_prompt = f"""Bạn là hệ thống AI giải thích kết quả truy xuất ảnh.
+        today_str = datetime.now().strftime("%Y-%m-%d")
+        current_year = datetime.now().strftime("%Y")
 
-Mục tiêu của bạn là cung cấp cho người dùng phần giải thích NGẮN GỌN, CHÍNH XÁC, TẬP TRUNG và DỄ HIỂU.
+        system_prompt = f"""You are a friendly image search assistant. Today is {today_str} (year {current_year}).
 
-Bắt buộc tuân thủ:
-- Chỉ trả lời tối đa 4 câu ngắn hoặc 4 gạch đầu dòng ngắn.
-- Câu đầu tiên phải đưa ra kết luận chung về mức độ khớp giữa kết quả và yêu cầu.
-- Chỉ nêu những ý quan trọng nhất.
-- Không mô tả dài dòng từng ảnh nếu không cần thiết.
-- Không lặp lại nguyên văn yêu cầu của người dùng.
-- Không suy đoán vượt quá những gì ảnh hoặc metadata cho phép kết luận.
-- Nếu chưa đủ chắc chắn, phải nói rõ mức độ chắc chắn còn hạn chế.
-- Nếu có ngày tháng, chỉ nhắc khi nó thực sự liên quan đến truy vấn.
-- Ưu tiên diễn đạt theo kiểu: kết luận trước, lý do chính sau.
+The user searched for images and the system returned results. Your job is to give a SHORT, NATURAL summary of what was found.
 
-Thông tin hệ thống cung cấp:
+Rules:
+- Write 2-4 short sentences like you're chatting with the user. Be warm and helpful.
+- Start with whether the results match what they asked for.
+- Briefly describe what you see in the images (if provided).
+- Mention dates only if the user asked about a time period.
+- Do NOT list technical details like similarity scores or distance values.
+- Do NOT repeat the user's query word-for-word.
+- Do NOT explain your reasoning process. Just give the final answer directly.
+- Write in the same language as the user's query.
+
+Context from the retrieval system:
 {metadata_context}
 """
 
         vision_messages = [
             system_prompt,
-            (
-                f"Yêu cầu người dùng: '{query_text}'. "
-                f"Hãy giải thích kết quả thật ngắn gọn, súc tích và chính xác. "
-                f"Ưu tiên nêu kết luận mức độ phù hợp trước, sau đó chỉ nêu các ý quan trọng nhất. "
-                f"Không lan man, không suy đoán quá mức."
-            )
+            f"The user searched for: \"{query_text}\". Here are the images found. Please summarize briefly."
         ]
 
-        image_payloads = []
+        # Build image content parts for Chat Completions Vision API (official Fireworks format)
+        user_content = [
+            {"type": "text", "text": vision_messages[1]}
+        ]
         for uri in retrieved_uris:
             base64_img = self._encode_image_to_base64(uri)
             if not base64_img:
@@ -567,37 +699,48 @@ Thông tin hệ thống cung cấp:
             if not mime_type:
                 mime_type = "image/jpeg"
 
-            image_payloads.append(f"data:{mime_type};base64,{base64_img}")
+            user_content.append({
+                "type": "image_url",
+                "image_url": {
+                    "url": f"data:{mime_type};base64,{base64_img}"
+                }
+            })
+
+        vision_chat_messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_content}
+        ]
 
         try:
-            print("   -> Đang thử gọi API chế độ Vision...")
-            vision_prompt = "SYSTEM: " + vision_messages[0] + "\n\nUSER:<image>\n" + vision_messages[1] + "\n\nASSISTANT:"
-            response = self._call_fireworks_vision_with_retry(
+            print("   -> Calling Vision API (Chat Completions format)...")
+            response = self._call_llm_with_retry(
                 model_name=model_name,
-                prompt=vision_prompt,
-                image_urls=image_payloads,
+                messages=vision_chat_messages,
                 max_tokens=800,
                 temperature=0.1
             )
-            return (response.choices[0].text or "").strip()
+            parts = self._split_thinking_and_answer(response)
+            return {
+                "thinking": parts["thinking"],
+                "answer": parts["answer"],
+                "source": "vision",
+                "raw": parts["raw"]
+            }
 
         except Exception as e:
             error_msg = str(e)
             short_error = error_msg[:200] if len(error_msg) > 200 else error_msg
-            print(f"⚠️ Lỗi Vision API: {short_error}")
-
-            print("🔄 Chuyển sang chế độ giải thích bằng Metadata (Text-Only)...")
+            print(f"   Vision API error: {short_error}")
+            print("   Falling back to metadata-only text explanation...")
 
             text_fallback_messages = [
                 {"role": "system", "content": system_prompt},
                 {
                     "role": "user",
                     "content": (
-                        f"Hệ thống đã tìm thấy {len(retrieved_uris)} bức ảnh liên quan đến yêu cầu '{query_text}', "
-                        f"nhưng hiện không thể gửi ảnh gốc cho bạn xem. "
-                        f"Hãy chỉ dựa trên metadata đã cung cấp để đưa ra nhận xét thật ngắn gọn, chính xác và thận trọng. "
-                        f"Nêu kết luận mức độ khớp trước, sau đó chỉ nói các ý quan trọng nhất. "
-                        f"Không lan man, không suy đoán quá mức."
+                        f"The user searched for: \"{query_text}\". "
+                        f"The system found {len(retrieved_uris)} images but cannot show them to you. "
+                        f"Based on the metadata in the system context, give a brief summary."
                     )
                 }
             ]
@@ -609,18 +752,21 @@ Thông tin hệ thống cung cấp:
                     max_tokens=600,
                     temperature=0.1
                 )
-                return (
-                    "*(Lưu ý: Server Custom API hiện tại không thể xử lý ảnh trực quan, "
-                    "hệ thống tự động chuyển sang giải thích bằng siêu dữ liệu)*\n\n"
-                    + self._extract_text_content(response_text_only)
-                )
+                parts = self._split_thinking_and_answer(response_text_only)
+                return {
+                    "thinking": parts["thinking"],
+                    "answer": parts["answer"],
+                    "source": "fallback",
+                    "raw": parts["raw"]
+                }
             except Exception as e2:
                 short_error2 = str(e2)[:200] if len(str(e2)) > 200 else str(e2)
-                return (
-                    f"⚠️ Rất tiếc, máy chủ API proxy đang không hoạt động sau nhiều lần thử lại.\n\n"
-                    f"**Chi tiết lỗi:** {short_error2}\n\n"
-                    f"💡 **Gợi ý:** Hãy kiểm tra lại biến môi trường `OPENAI_BASE_URL` hoặc thử lại sau vài phút."
-                )
+                return {
+                    "thinking": "",
+                    "answer": f"API không phản hồi sau nhiều lần thử.\nChi tiết: {short_error2}",
+                    "source": "error",
+                    "raw": ""
+                }
 
     # ==========================================
     # UTILS & INDEXING

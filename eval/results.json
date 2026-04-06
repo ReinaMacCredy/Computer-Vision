@@ -1,0 +1,84 @@
+{
+  "retrieval_evaluation": {
+    "k=5": {
+      "Precision@5": 0.5666666666666668,
+      "Recall@5": 0.04872632813809285,
+      "F1@5": 0.08862385321100918,
+      "nDCG@5": 0.5455426165271019,
+      "MRR": 0.5833333333333334
+    },
+    "k=10": {
+      "Precision@10": 0.5,
+      "Recall@10": 0.09068417965476788,
+      "F1@10": 0.15048378522062733,
+      "nDCG@10": 0.507343350456171,
+      "MRR": 0.5833333333333334
+    }
+  },
+  "threshold_calibration": {
+    "best_threshold": 0.01,
+    "best_f1": 0.6666666666666666,
+    "all_stats": [
+      {
+        "threshold": 0.01,
+        "precision": 0.5,
+        "recall": 1.0,
+        "f1": 0.6666666666666666
+      },
+      {
+        "threshold": 0.02,
+        "precision": 0.4807692307692308,
+        "recall": 0.8333333333333334,
+        "f1": 0.6097560975609756
+      },
+      {
+        "threshold": 0.03,
+        "precision": 0.375,
+        "recall": 0.4,
+        "f1": 0.38709677419354843
+      },
+      {
+        "threshold": 0.05,
+        "precision": 0.3333333333333333,
+        "recall": 0.1,
+        "f1": 0.15384615384615383
+      },
+      {
+        "threshold": 0.08,
+        "precision": 0.0,
+        "recall": 0.0,
+        "f1": 0.0
+      },
+      {
+        "threshold": 0.1,
+        "precision": 0.0,
+        "recall": 0.0,
+        "f1": 0.0
+      },
+      {
+        "threshold": 0.15,
+        "precision": 0.0,
+        "recall": 0.0,
+        "f1": 0.0
+      },
+      {
+        "threshold": 0.2,
+        "precision": 0.0,
+        "recall": 0.0,
+        "f1": 0.0
+      },
+      {
+        "threshold": 0.25,
+        "precision": 0.0,
+        "recall": 0.0,
+        "f1": 0.0
+      },
+      {
+        "threshold": 0.3,
+        "precision": 0.0,
+        "recall": 0.0,
+        "f1": 0.0
+      }
+    ]
+  }
+}

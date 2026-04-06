@@ -1,5 +1,6 @@
 import os
 import sys
+import re
 import tempfile
 import streamlit as st
 
@@ -147,20 +148,61 @@ def render_result_grid(found_data, columns_per_row=2):
             </div><br>
             """, unsafe_allow_html=True)
 
-def render_ai_explanation(explanation: str):
+def render_ai_explanation(explanation):
     """
-    Hiển thị phần giải thích AI theo cách gọn, dễ đọc hơn.
+    Hiển thị phần giải thích AI: Thinking (collapsible) + Answer (always visible).
+    Accepts either a string (legacy) or dict with thinking/answer/source keys.
     """
     if not explanation:
         st.warning("Chưa có nội dung giải thích từ AI.")
         return
 
-    safe_text = explanation.strip().replace("\n", "<br>")
-    st.markdown(f"""
-    <div class="ai-summary-box">
-        {safe_text}
-    </div>
-    """, unsafe_allow_html=True)
+    # Handle legacy string format
+    if isinstance(explanation, str):
+        explanation = {"thinking": "", "answer": explanation, "source": "legacy", "raw": explanation}
+
+    source = explanation.get("source", "")
+    thinking = explanation.get("thinking", "")
+    answer = explanation.get("answer", "")
+
+    # Source badge
+    if source == "fallback":
+        st.markdown("""
+        <div style="background:#1e293b;border:1px solid #334155;border-radius:8px;padding:8px 14px;
+            font-size:12px;color:#94a3b8;margin-bottom:8px;display:inline-block;">
+            ⚡ Vision API không khả dụng -- giải thích dựa trên siêu dữ liệu
+        </div>
+        """, unsafe_allow_html=True)
+    elif source == "vision":
+        st.markdown("""
+        <div style="background:#0f2a1f;border:1px solid #1a4a33;border-radius:8px;padding:8px 14px;
+            font-size:12px;color:#6ee7b7;margin-bottom:8px;display:inline-block;">
+            ✓ Vision API -- phân tích trực tiếp từ nội dung ảnh
+        </div>
+        """, unsafe_allow_html=True)
+
+    # Thinking section (always show if available)
+    if thinking:
+        with st.expander("🧠 Thinking (AI reasoning trace)", expanded=False):
+            st.markdown(f"""<div style="
+                background: #1a1a2e;
+                border-left: 3px solid #7c3aed;
+                border-radius: 0 8px 8px 0;
+                padding: 14px 18px;
+                font-size: 13px;
+                line-height: 1.7;
+                color: #c4b5fd;
+                white-space: pre-wrap;
+            ">{thinking}</div>""", unsafe_allow_html=True)
+
+    # Answer section (always visible)
+    if answer:
+        safe_text = answer.strip().replace("\n", "<br>")
+        st.markdown(f"""
+        <div class="ai-summary-box">{safe_text}</div>
+        """, unsafe_allow_html=True)
+    elif not thinking:
+        st.warning("Chưa có nội dung giải thích từ AI.")
 
 # ==========================================
 # 3. SIDEBAR: QUẢN LÝ DỮ LIỆU
@@ -199,6 +241,12 @@ with tab1:
     with col_b:
         use_ai_intent = st.checkbox("Dùng AI để bóc tách ý định và dịch sang tiếng Anh", value=True)
 
+    min_sim = st.slider(
+        "Ngưỡng tương đồng tối thiểu (0 = tắt lọc)",
+        min_value=0.0, max_value=1.0, value=0.0, step=0.01,
+        help="Lọc bỏ kết quả có similarity thấp hơn ngưỡng này. Đặt 0 để hiển thị tất cả."
+    )
+
     if st.button("Tìm kiếm & Phân tích", type="primary"):
         if not query_text.strip():
             st.error("Vui lòng nhập câu truy vấn!")
@@ -225,14 +273,10 @@ with tab1:
 
                 if "_llm_error" in intent:
                     st.warning(
-                        "⚠️ Provider có phản hồi nhưng không trả về JSON hợp lệ để phân tích. "
+                        "Provider không trả về JSON hợp lệ. "
                         "Hệ thống sẽ tìm trực tiếp bằng từ khóa gốc.\n\n"
                         f"*Chi tiết: {intent['_llm_error']}*"
                     )
-                    raw_output = intent.get("_llm_raw_output")
-                    if raw_output:
-                        with st.expander("Xem phản hồi thô từ model"):
-                            st.code(raw_output)
 
                 if not intent.get("max_results"):
                     intent["max_results"] = int(top_k)
@@ -240,6 +284,40 @@ with tab1:
                 intent["max_results"] = int(top_k)
 
             st.markdown("#### 🔎 Ý định truy vấn đã được phân tích")
+
+            # Always show thinking trace when AI Intent is used
+            raw_thinking = intent.get("_llm_raw_output", "")
+            if use_ai_intent and raw_thinking:
+                # Clean: separate reasoning from JSON
+                thinking_text = raw_thinking
+                # Remove JSON objects
+                thinking_text = re.sub(r'\{[^{}]*"english_query"[^{}]*\}', '', thinking_text)
+                # Remove code fences
+                thinking_text = re.sub(r'```json?', '', thinking_text)
+                thinking_text = thinking_text.replace('```', '')
+                thinking_text = thinking_text.strip()
+
+                # If model returned pure JSON (no reasoning), show a summary instead
+                if not thinking_text:
+                    thinking_text = (
+                        f"Query: \"{query_text}\"\n"
+                        f"Translated to: \"{intent.get('english_query', query_text)}\"\n"
+                        f"Date filter: {intent.get('start_date', 'None')} to {intent.get('end_date', 'None')}\n"
+                        f"Max results: {intent.get('max_results', 4)}"
+                    )
+
+                with st.expander("🧠 Thinking", expanded=False):
+                    st.markdown(f"""<div style="
+                        background: #1a1a2e;
+                        border-left: 3px solid #7c3aed;
+                        border-radius: 0 8px 8px 0;
+                        padding: 14px 18px;
+                        font-size: 13px;
+                        line-height: 1.7;
+                        color: #c4b5fd;
+                        white-space: pre-wrap;
+                    ">{thinking_text}</div>""", unsafe_allow_html=True)
+
             st.markdown(f"""
             <div class="intent-box">
                 <b>English query:</b> {intent.get("english_query", query_text)}<br>
@@ -255,17 +333,26 @@ with tab1:
                         user_query=intent.get("english_query", query_text),
                         start_date=intent.get("start_date"),
                         end_date=intent.get("end_date"),
-                        max_results=int(intent.get("max_results", top_k))
+                        max_results=int(intent.get("max_results", top_k)),
+                        min_similarity=min_sim if min_sim > 0 else None
                     )
                 except Exception as e:
                     found_data = []
                     st.error(f"Lỗi trong quá trình truy xuất ảnh: {e}")
 
             if not found_data:
-                st.warning("Không tìm thấy ảnh nào khớp với mô tả trong cơ sở dữ liệu.")
+                if min_sim > 0:
+                    st.warning(f"Không tìm thấy ảnh nào có similarity >= {min_sim:.2f}. Thử giảm ngưỡng hoặc đặt về 0.")
+                else:
+                    st.warning("Không tìm thấy ảnh nào khớp với mô tả trong cơ sở dữ liệu.")
             else:
                 metric = found_data[0].get("metric", "unknown")
-                st.success(f"Đã tìm thấy {len(found_data)} ảnh tương đồng!")
+                requested_k = int(intent.get("max_results", top_k))
+                filtered_count = requested_k - len(found_data)
+                if filtered_count > 0 and min_sim > 0:
+                    st.success(f"Đã tìm thấy {len(found_data)} ảnh tương đồng! ({filtered_count} kết quả bị lọc do similarity < {min_sim:.2f})")
+                else:
+                    st.success(f"Đã tìm thấy {len(found_data)} ảnh tương đồng!")
 
                 if metric != "cosine":
                     st.info(
@@ -312,6 +399,13 @@ with tab2:
         key="img_top_k"
     )
 
+    min_sim_img = st.slider(
+        "Ngưỡng tương đồng tối thiểu (0 = tắt lọc)",
+        min_value=0.0, max_value=1.0, value=0.0, step=0.01,
+        key="img_min_sim",
+        help="Lọc bỏ kết quả có similarity thấp hơn ngưỡng này."
+    )
+
     if uploaded_file is not None:
         st.image(uploaded_file, caption="Ảnh bạn vừa tải lên", width=300)
 
@@ -327,7 +421,8 @@ with tab2:
 
                     found_data = engine.image_to_image_retrieval(
                         query_image_path=temp_path,
-                        max_results=int(top_k_img)
+                        max_results=int(top_k_img),
+                        min_similarity=min_sim_img if min_sim_img > 0 else None
                     )
 
                 if not found_data:
